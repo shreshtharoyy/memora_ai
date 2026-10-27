@@ -14,7 +14,7 @@ class SQLiteMemoryStore:
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         with self._connect() as connection:
-            connection.executescript(
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,34 +26,108 @@ class SQLiteMemoryStore:
                     source TEXT NOT NULL DEFAULT 'user',
                     confidence REAL,
                     status TEXT NOT NULL DEFAULT 'active'
-                        CHECK (
-                            status IN (
-                                'active',
-                                'superseded',
-                                'invalidated'
-                            )
-                        ),
+                        CHECK (status IN (
+                            'active', 'superseded', 'invalidated'
+                        )),
                     created_at TEXT NOT NULL,
-                    supersedes_id INTEGER
-                        REFERENCES memories(id)
-                );
+                    supersedes_id INTEGER REFERENCES memories(id)
+                )
+                """
+            )
 
-                CREATE INDEX IF NOT EXISTS idx_memories_user_slot
-                ON memories(user_id, slot, status);
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_user_slot_status
+                ON memories(user_id, slot, status)
+                """
+            )
 
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_memories_created_at
-                ON memories(created_at);
+                ON memories(created_at)
+                """
+            )
+
+            # FTS5 index for full-text memory retrieval.
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(
+                    slot,
+                    value,
+                    category,
+                    scope,
+                    content='memories',
+                    content_rowid='id'
+                )
+                """
+            )
+
+            # Keep the FTS5 index synchronized with the memories table.
+            connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS memories_ai
+                AFTER INSERT ON memories
+                BEGIN
+                    INSERT INTO memories_fts(
+                        rowid, slot, value, category, scope
+                    )
+                    VALUES (
+                        new.id, new.slot, new.value,
+                        new.category, new.scope
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_ad
+                AFTER DELETE ON memories
+                BEGIN
+                    INSERT INTO memories_fts(
+                        memories_fts, rowid, slot, value, category, scope
+                    )
+                    VALUES (
+                        'delete', old.id, old.slot, old.value,
+                        old.category, old.scope
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_au
+                AFTER UPDATE OF slot, value, category, scope ON memories
+                BEGIN
+                    INSERT INTO memories_fts(
+                        memories_fts, rowid, slot, value, category, scope
+                    )
+                    VALUES (
+                        'delete', old.id, old.slot, old.value,
+                        old.category, old.scope
+                    );
+
+                    INSERT INTO memories_fts(
+                        rowid, slot, value, category, scope
+                    )
+                    VALUES (
+                        new.id, new.slot, new.value,
+                        new.category, new.scope
+                    );
+                END;
+                """
+            )
+
+            # Populate the index for records that existed before FTS5 was added.
+            connection.execute(
+                """
+                INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')
                 """
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.db_path,
-            timeout=10.0,
-        )
+        connection = sqlite3.connect(self.db_path, timeout=10.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
+
+        if self.db_path != ":memory:":
+            connection.execute("PRAGMA journal_mode = WAL")
+
         return connection
 
     @staticmethod
@@ -65,7 +139,6 @@ class SQLiteMemoryStore:
         user_id: str,
         slot: str,
         value: str,
-        *,
         category: str = "general",
         scope: str = "general",
         source: str = "user",
@@ -84,22 +157,17 @@ class SQLiteMemoryStore:
             cursor = connection.execute(
                 """
                 INSERT INTO memories (
-                    user_id, slot, value, category, scope,
-                    source, confidence, status, created_at
+                    user_id, slot, value, category, scope, source,
+                    confidence, status, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
                 """,
                 (
-                    user_id,
-                    slot,
-                    value,
-                    category,
-                    scope,
-                    source,
-                    confidence,
-                    self._now(),
+                    user_id, slot, value, category, scope, source,
+                    confidence, self._now(),
                 ),
             )
+
             if cursor.lastrowid is None:
                 raise RuntimeError("Failed to retrieve the inserted memory ID.")
 
@@ -109,15 +177,11 @@ class SQLiteMemoryStore:
         self,
         user_id: str,
         slot: str,
-        *,
         scope: str | None = None,
     ) -> list[dict[str, Any]]:
         query = """
-            SELECT *
-            FROM memories
-            WHERE user_id = ?
-              AND slot = ?
-              AND status = 'active'
+            SELECT * FROM memories
+            WHERE user_id = ? AND slot = ? AND status = 'active'
         """
         params: list[Any] = [user_id, slot]
 
@@ -135,11 +199,9 @@ class SQLiteMemoryStore:
         self,
         old_memory_id: int,
         new_value: str,
-        *,
         source: str = "user",
         confidence: float | None = None,
     ) -> int:
-        """Replace an active fact while preserving its history."""
         if not new_value.strip():
             raise ValueError("new_value cannot be empty.")
         if confidence is not None and not 0.0 <= confidence <= 1.0:
@@ -148,8 +210,7 @@ class SQLiteMemoryStore:
         with self._connect() as connection:
             old_memory = connection.execute(
                 """
-                SELECT *
-                FROM memories
+                SELECT * FROM memories
                 WHERE id = ? AND status = 'active'
                 """,
                 (old_memory_id,),
@@ -164,7 +225,7 @@ class SQLiteMemoryStore:
                 """
                 UPDATE memories
                 SET status = 'superseded'
-                WHERE id = ? AND status = 'active'
+                WHERE id = ?
                 """,
                 (old_memory_id,),
             )
@@ -172,9 +233,8 @@ class SQLiteMemoryStore:
             cursor = connection.execute(
                 """
                 INSERT INTO memories (
-                    user_id, slot, value, category, scope,
-                    source, confidence, status, created_at,
-                    supersedes_id
+                    user_id, slot, value, category, scope, source,
+                    confidence, status, created_at, supersedes_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
@@ -215,7 +275,6 @@ class SQLiteMemoryStore:
     def list_memories(
         self,
         user_id: str,
-        *,
         include_inactive: bool = False,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM memories WHERE user_id = ?"
@@ -228,4 +287,42 @@ class SQLiteMemoryStore:
 
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def search_memories(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+
+        if not user_id.strip():
+            raise ValueError("user_id cannot be empty.")
+        if not query.strip():
+            raise ValueError("Search query cannot be empty.")
+        if limit <= 0:
+            raise ValueError("limit must be a positive integer.")
+
+        # Convert ordinary query text into safely quoted FTS5 terms.
+        terms = query.split()
+        fts_query = " OR ".join(
+            '"' + term.replace('"', '""') + '"'
+            for term in terms
+        )
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT memories.*, bm25(memories_fts) AS search_rank
+                FROM memories_fts
+                JOIN memories ON memories.id = memories_fts.rowid
+                WHERE memories_fts MATCH ?
+                  AND memories.user_id = ?
+                  AND memories.status = 'active'
+                ORDER BY search_rank ASC, memories.id DESC
+                LIMIT ?
+                """,
+                (fts_query, user_id, limit),
+            ).fetchall()
+
             return [dict(row) for row in rows]
